@@ -13,7 +13,7 @@ from causal_node_extractor import CausalNodeExtractor
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ==========================================================
-# 1) LLM 観測層：剛性・Phi・CII の抽出（あなたの2つのコードを統合）
+# 1) LLM 観測層：剛性・Phi・CII の抽出
 # ==========================================================
 class LLMCausalObserver:
     def __init__(self, model_id="Qwen/Qwen2.5-7B-Instruct"):
@@ -29,7 +29,7 @@ class LLMCausalObserver:
     def reset(self):
         self.phi_history = []
 
-    # ---- 事実から「期待剛性」を学習（あなたの CausalInertiaLogger の統合） ----
+    # ---- 事実から「期待剛性」を学習 ----
     def train_topology(self, texts):
         print("[Observer] Learning expected rigidity from facts...")
         for text in texts:
@@ -40,7 +40,7 @@ class LLMCausalObserver:
                 outputs = self.model(**inputs)
 
             for k in range(len(ids)-1):
-                p = F.softmax(outputs.logits[0, k, :], dim=-1)
+                p = F.softmax(outputs.logits[0, k, :].float(), dim=-1)
                 top_p, _ = torch.topk(p, 50)
                 rig = 1.0 / (torch.var(top_p).item() + 1e-6)
 
@@ -52,7 +52,6 @@ class LLMCausalObserver:
 
     # ---- Phi（位相） ----
     def calculate_phi(self, logits):
-        # 演算精度による nan 防止のため float32 で計算
         logits_f = logits.float()
         probs = F.softmax(logits_f, dim=-1)
         top_v, _ = torch.topk(probs, 50)
@@ -79,7 +78,6 @@ class LLMCausalObserver:
         probs = F.softmax(logits_f, dim=-1)
         mean = torch.mean(probs)
         std = torch.std(probs)
-        # 4次モーメントの計算
         kurt = torch.mean(((probs - mean) / (std + 1e-10))**4)
         return kurt.item()
 
@@ -103,13 +101,13 @@ class LLMCausalObserver:
         phi = self.calculate_phi(logits)
         self.phi_history.append(phi)
         cii = self.calculate_cii()
-        
+
         entropy = self.calculate_entropy(logits)
         top1_prob = self.calculate_top1_prob(logits)
         kurtosis = self.calculate_kurtosis(logits)
 
         next_token = torch.argmax(logits).item()
-        
+
         metrics = {
             "phi": phi,
             "cii": cii,
@@ -117,7 +115,7 @@ class LLMCausalObserver:
             "top1_prob": top1_prob,
             "kurtosis": kurtosis
         }
-        
+
         return next_token, metrics, logits
 
 
@@ -174,12 +172,12 @@ class CausalCore(nn.Module):
         ], dim=1)
 
         S = self._get_S_core(epoch)
-        
+
         # --- 原子操作 (Atomic Interventions) の適用 ---
         r_scale = torch.ones_like(S)
         phi_shift = torch.zeros_like(S)
         omega_eff = self.omega.clone()
-        
+
         if atomic_interventions:
             # 1) Delete/Insert (Structure)
             if 'delete' in atomic_interventions:
@@ -188,25 +186,24 @@ class CausalCore(nn.Module):
             if 'insert' in atomic_interventions:
                 for i, j in atomic_interventions['insert']:
                     S[i, j] = 1.0
-            
+
             # 2) Scale (Intensity)
             if 'scale' in atomic_interventions:
                 for i, j, alpha in atomic_interventions['scale']:
                     r_scale[i, j] *= alpha
-            
+
             # 3) Invert (Polarity)
             if 'invert' in atomic_interventions:
                 for i, j in atomic_interventions['invert']:
                     phi_shift[i, j] += np.pi
-            
+
             # 4) Delay (Tense/Frequency)
             if 'delay_omega' in atomic_interventions:
                 omega_eff += atomic_interventions['delay_omega']
-                
+
             # 5) Permute (Logical Structure / Non-Hermitian)
             if 'permute' in atomic_interventions:
                 for i, j in atomic_interventions['permute']:
-                    # インデックスの入れ替えによる構造的矛盾（非エルミート化のシミュレーション）
                     tmp = S[i, j].clone()
                     S[i, j] = S[j, i]
                     S[j, i] = tmp * 2.0 # 発散を誘発
@@ -220,13 +217,11 @@ class CausalCore(nn.Module):
 
         for k in range(self.K):
             w_k = (1.0 - self_loop_mask) if k == 0 else self_loop_mask
-            
-            # e^{i(phi + omega*t)}
-            theta = (self.raw_phase.unsqueeze(0) 
-                     + phi_curr[:, k].view(B, 1, 1) 
+            theta = (self.raw_phase.unsqueeze(0)
+                     + phi_curr[:, k].view(B, 1, 1)
                      + phi_shift.unsqueeze(0)
                      + omega_eff * t)
-            
+
             A = S.unsqueeze(0) * w_k * r_mode[:, k].view(B, 1, 1) * r_scale.unsqueeze(0)
 
             if do_mask is not None:
@@ -239,7 +234,6 @@ class CausalCore(nn.Module):
                 A * (torch.sin(theta)*x_real + torch.cos(theta)*x_imag), dim=2
             )
 
-        # 活性化関数 sigma
         x_next = torch.stack([torch.tanh(out_real), torch.tanh(out_imag)], dim=-1)
         return x_next, phi_curr
 
@@ -273,7 +267,6 @@ class CausalMetrics:
 # ==========================================================
 class SMatrixEngine:
     def __init__(self):
-        # matrix: (prev_token_id) -> {next_token_id: rigidity}
         self.matrix = defaultdict(lambda: defaultdict(float))
 
     def register_sequence(self, token_ids, rigidity=50.0):
@@ -285,12 +278,76 @@ class SMatrixEngine:
     def adjust_logits(self, last_token_id, logits, lambda_val=2.0):
         if last_token_id in self.matrix:
             for nxt_id, rig in self.matrix[last_token_id].items():
-                # logits[B, Vocab] に対して最後の次元（トークン）に加算
                 logits[..., nxt_id] += lambda_val * rig
         return logits
 
+
 # ==========================================================
-# 5) 統合OS：Unified CausalOS
+# 5) 追加ユーティリティ：Causal Primitive Encoder
+# ==========================================================
+class CausalPrimitiveEncoder:
+    """
+    Convert a natural language outcome into a causal primitive vector
+    """
+    @staticmethod
+    def encode(text: str):
+        t = text.lower()
+        prim = {
+            "substitution": 0.0,
+            "negation": 0.0,
+            "intensity": 0.0,
+            "tense": 0.0,
+            "impossibility": 0.0
+        }
+        if any(w in t for w in ["instead", "replace", "changed into"]):
+            prim["substitution"] = 1.0
+        if any(w in t for w in ["not", "never", "didn't", "failed to"]):
+            prim["negation"] = 1.0
+        if any(w in t for w in ["more", "faster", "heavier", "stronger"]):
+            prim["intensity"] = 1.0
+        elif any(w in t for w in ["less", "slower", "weaker"]):
+            prim["intensity"] = -1.0
+        if any(w in t for w in ["earlier", "before"]):
+            prim["tense"] = -1.0
+        elif any(w in t for w in ["later", "after"]):
+            prim["tense"] = 1.0
+        if any(w in t for w in ["impossible", "cannot", "category error", "nonsense", "not possible", "不可能"]):
+            prim["impossibility"] = 1.0
+        return prim
+
+def expected_primitives(phenom, csi, cii, impossible):
+    p = {
+        "substitution": 0.0,
+        "negation": 0.0,
+        "intensity": 0.0,
+        "tense": 0.0,
+        "impossibility": 0.0
+    }
+    if phenom == "SUBSTITUTION":
+        p["substitution"] = 1.0
+    elif phenom == "NEGATION":
+        p["negation"] = 1.0
+    elif phenom == "INTENSITY":
+        p["intensity"] = 1.0
+    elif phenom == "TENSE":
+        p["tense"] = 1.0
+    elif phenom == "IMPOSSIBILITY":
+        p["impossibility"] = 1.0
+
+    if impossible or cii > 1e3:
+        p["impossibility"] = 1.0
+    if csi < 0.01:
+        p["negation"] *= 0.5
+    return p
+
+def primitive_distance(p1, p2):
+    v1 = np.array(list(p1.values()), dtype=np.float32)
+    v2 = np.array(list(p2.values()), dtype=np.float32)
+    return np.linalg.norm(v1 - v2)
+
+
+# ==========================================================
+# 6) 統合OS：Unified CausalOS
 # ==========================================================
 class UnifiedCausalOS:
     def __init__(self, n_vars=5):
@@ -299,12 +356,11 @@ class UnifiedCausalOS:
         self.metrics = CausalMetrics()
         self.s_matrix = SMatrixEngine()
         self.node_extractor = CausalNodeExtractor(
-            model=self.observer.model, 
+            model=self.observer.model,
             tokenizer=self.observer.tokenizer
         )
         self.causal_core.eval()
 
-        # ノード対応（可変）
         self.mapping = {
             "man": 0,
             "walk": 1,
@@ -313,222 +369,139 @@ class UnifiedCausalOS:
             "destination": 4
         }
 
-    # ---- プロンプトに対する安定性（迷い）を評価 ----
+    def reset(self):
+        self.observer.reset()
+
     def get_semantic_stability(self, text, steps=5):
         self.observer.reset()
         input_ids = self.observer.tokenizer(text, return_tensors="pt").to(device).input_ids
-        
-        ents = []
-        ciis = []
-        
-        # 最初の一歩
+        ents, ciis = [], []
+
         next_tok, metrics, _ = self.observer.step(input_ids)
         ents.append(metrics['entropy'])
         ciis.append(metrics['cii'])
-        
-        # 数歩ロールアウトして動態を見る
+
         curr_ids = input_ids
         for _ in range(steps):
             curr_ids = torch.cat([curr_ids, torch.tensor([[next_tok]]).to(device)], dim=-1)
             next_tok, metrics, _ = self.observer.step(curr_ids)
             ents.append(metrics['entropy'])
             ciis.append(metrics['cii'])
-            
         return np.mean(ents), np.mean(ciis)
 
-    # ---- LLMの迷いから do を決定 ----
     def detect_intervention_from_llm(self, prompt, horizon=30):
         self.observer.reset()
-        input_ids = self.observer.tokenizer(
-            prompt, return_tensors="pt"
-        ).to(self.observer.model.device).input_ids
-
-        phi_traj = []
-        cii_traj = []
+        input_ids = self.observer.tokenizer(prompt, return_tensors="pt").to(device).input_ids
+        phi_traj, cii_traj = [], []
 
         for t in range(horizon):
             next_tok, metrics, _ = self.observer.step(input_ids)
             phi_traj.append(metrics["phi"])
             cii_traj.append(metrics["cii"])
+            input_ids = torch.cat([input_ids, torch.tensor([[next_tok]]).to(device)], dim=-1)
 
-            input_ids = torch.cat(
-                [input_ids, torch.tensor([[next_tok]]).to(input_ids.device)],
-                dim=-1
-            )
+        return int(np.argmax(np.abs(cii_traj)))
 
-        # CII 最大点を介入時刻とする
-        t_do = int(np.argmax(np.abs(cii_traj)))
-        return t_do
-
-    # ---- CausalCore で rollout ----
     def rollout_with_intervention(self, initial_energy=0.5, atomic_interventions=None, horizon=20):
         x = torch.zeros(1, self.causal_core.n_vars, 2, device=device)
-        x[0, :, 0] = initial_energy 
-        
+        x[0, :, 0] = initial_energy
         hist = torch.zeros(1, self.causal_core.n_vars, device=device)
         phi_history = []
 
         for t in range(horizon):
             with torch.no_grad():
-                x, phi = self.causal_core(
-                    x, hist, 
-                    atomic_interventions=atomic_interventions, 
-                    t=t
-                )
-
+                x, phi = self.causal_core(x, hist, atomic_interventions=atomic_interventions, t=t)
             phi_history.append(phi.mean())
             hist = x[:, :, 0]
-
         return torch.stack(phi_history)
 
-    # ---- 介入の現象分類 (Phenomenology Classification) ----
     def classify_phenomenology(self, factual, cf):
         prompt = f"""Classify the type of counterfactual intervention between these two sentences.
 Factual: {factual}
 Counterfactual: {cf}
 
 Categories:
-1. SUBSTITUTION: A is replaced by B (e.g., 'street' instead of 'bed')
-2. NEGATION: A is negated (e.g., 'not' or 'never')
-3. INTENSITY: The degree or speed of A changes (e.g., 'more', 'less', 'fast', 'heavy')
-4. TENSE: The time or order of events changes (e.g., 'earlier', 'later', 'after', 'before')
-5. IMPOSSIBILITY: Logic error, category error, or paradox (e.g., 'planter grows in plant')
+1. SUBSTITUTION: A is replaced by B
+2. NEGATION: A is negated (e.g., 'not')
+3. INTENSITY: Degree or speed changes (e.g., 'more', 'fast')
+4. TENSE: Time or order changes (e.g., 'earlier', 'after')
+5. IMPOSSIBILITY: Logic error or paradox
 
 Return only the category name.
 Result:"""
         category = self.generate_short(prompt, max_new_tokens=5).strip().upper()
-        
         for cat in ["SUBSTITUTION", "NEGATION", "INTENSITY", "TENSE", "IMPOSSIBILITY"]:
-            if cat in category:
-                return cat
-        return "SUBSTITUTION" # Default
+            if cat in category: return cat
+        return "SUBSTITUTION"
 
-    # ---- 短文生成（論理チェック用） ----
     def generate_short(self, prompt, max_new_tokens=10):
         inputs = self.observer.tokenizer(prompt, return_tensors="pt").to(device)
         with torch.no_grad():
             outputs = self.observer.model.generate(
-                **inputs, 
-                max_new_tokens=max_new_tokens, 
-                do_sample=False,
-                temperature=None,
-                top_p=None,
-                top_k=None,
+                **inputs, max_new_tokens=max_new_tokens, do_sample=False,
+                temperature=None, top_p=None, top_k=None,
                 pad_token_id=self.observer.tokenizer.eos_token_id
             )
-        response = self.observer.tokenizer.decode(outputs[0][inputs.input_ids.shape[-1]:], skip_special_tokens=True)
-        return response
+        return self.observer.tokenizer.decode(outputs[0][inputs.input_ids.shape[-1]:], skip_special_tokens=True)
 
-    # ---- 因果チェック付き生成 ----
     def generate_with_causal_check(self, prompt, max_new_tokens=20, hesitation_threshold=1.0):
         input_ids = self.observer.tokenizer(prompt, return_tensors="pt").to(device).input_ids
-        
         generated_ids = input_ids[0].tolist()
-        
         for _ in range(max_new_tokens):
             input_tensor = torch.tensor([generated_ids]).to(device)
             next_token, metrics, logits = self.observer.step(input_tensor)
-            
-            # 迷い検知 (エントロピーが高い、または CII が閾値を超えた場合)
             if metrics["entropy"] > 2.0 or abs(metrics["cii"]) > hesitation_threshold:
-                # print(f"[CausalOS] Hesitation detected (entropy={metrics['entropy']:.2f}, cii={metrics['cii']:.2f}). Applying S-Matrix.")
                 logits = self.s_matrix.adjust_logits(generated_ids[-1], logits)
                 next_token = torch.argmax(logits).item()
-            
             generated_ids.append(next_token)
-            if next_token == self.observer.tokenizer.eos_token_id:
-                break
-                
+            if next_token == self.observer.tokenizer.eos_token_id: break
         return self.observer.tokenizer.decode(generated_ids, skip_special_tokens=True)
 
-    # ---- 反実テスト ----
     def solve_counterfactual(self, factual, cf, options=None):
         print("\n=== Unified CausalOS ===")
-
-        # 1. 介入の現象分類
         phenom = self.classify_phenomenology(factual, cf)
         print(f"[CausalOS] Phenomenology: {phenom}")
 
-        # 2. ノード抽出と介入ポイント
         nodes_f = self.node_extractor.extract_nodes(factual)
         nodes_c = self.node_extractor.extract_nodes(cf)
-        
-        # マッピング更新
         self.mapping = {node: i for i, node in enumerate(nodes_f[:self.causal_core.n_vars])}
-        
+
         removed = [n for n in nodes_f if n.lower() not in [nc.lower() for nc in nodes_c]]
-        added = [n for n in nodes_c if n.lower() not in [nf.lower() for nf in nodes_f]]
-        
         orig_node = removed[0] if removed else nodes_f[-1]
-        new_node = added[0] if added else "unknown"
-        
         do_idx = self.mapping.get(orig_node, 0)
 
-        # 3. 原子操作 (Atomic Interventions) へのマッピング
         atomic_int = {}
         if phenom == "SUBSTITUTION":
-            # A -> B: S_ij=0, S_ik=1 (iは前ノード、jはorig、kはnew)
-            # 簡易的に全ての流入をカット
-            atomic_int['delete'] = [(i, do_idx) for i in range(self.causal_core.n_vars)]
+            atomic_int["delete"] = [(i, do_idx) for i in range(self.causal_core.n_vars)]
         elif phenom == "NEGATION":
-            # not A: phi -> phi + pi
-            atomic_int['invert'] = [(i, do_idx) for i in range(self.causal_core.n_vars)]
+            atomic_int["invert"] = [(i, do_idx) for i in range(self.causal_core.n_vars)]
         elif phenom == "INTENSITY":
-            # more/less: Scale r
-            alpha = 2.0 if "more" in cf.lower() or "fast" in cf.lower() else 0.5
-            atomic_int['scale'] = [(i, do_idx, alpha) for i in range(self.causal_core.n_vars)]
+            atomic_int["scale"] = [(i, do_idx, 2.0) for i in range(self.causal_core.n_vars)]
         elif phenom == "TENSE":
-            # Earlier/Later: Delay omega
-            atomic_int['delay_omega'] = 0.5
+            atomic_int["delay_omega"] = 0.5
         elif phenom == "IMPOSSIBILITY":
-            # Category Error: Permute
-            atomic_int['permute'] = [(do_idx, (do_idx+1)%self.causal_core.n_vars)]
+            atomic_int["permute"] = [(do_idx, (do_idx + 1) % self.causal_core.n_vars)]
 
-        # 4. 物理シミュレーション (CausalCore)
         self.observer.reset()
         _, f_metrics, _ = self.observer.step(self.observer.tokenizer(factual, return_tensors="pt").to(device).input_ids)
-        initial_energy = min(1.0, f_metrics['phi'] / 50.0)
-        
+        initial_energy = min(1.0, f_metrics["phi"] / 50.0)
         phi_traj = self.rollout_with_intervention(initial_energy=initial_energy, atomic_interventions=atomic_int)
         csi = self.metrics.compute_CSI(phi_traj.unsqueeze(0))
         cii = self.metrics.compute_CII(phi_traj)
-        
-        # 不可能性（発散）の検知
-        is_impossible = torch.isnan(phi_traj).any() or cii > 1e4 or phenom == "IMPOSSIBILITY"
-        print(f"Causal Rollout Metrics: CSI={csi:.6f}, CII={cii:.6f}, Impossible={is_impossible}")
+        impossible = torch.isnan(phi_traj).any() or cii > 1e4 or phenom == "IMPOSSIBILITY"
+        print(f"Causal Rollout: CSI={csi:.4e}, CII={cii:.4e}, Impossible={impossible}")
 
-        # 5. セマンティックな妥当性評価
-        if options:
-            scores = {}
-            for key, outcome in options.items():
-                # ユーザー提案のプロンプト形式
-                prompt = f"""Scenario: {new_node} instead of {orig_node}
-Outcome: {outcome}
-Is this logical? Answer: Yes or No"""
-                
-                response = self.generate_short(prompt)
-                is_logical = "yes" in response.lower()
-                scores[key] = 1 if is_logical else 0
-                print(f"Option {key}: Logical? {'Yes' if is_logical else 'No'} (Resp: {response.strip()})")
-            
-            # 最高スコアを選択
-            if max(scores.values()) == 0:
-                # 全て No の場合、"Nothing special" や "not possible" を探すか、デフォルト B
-                for key, val in options.items():
-                    if "nothing" in val.lower() or "not possible" in val.lower() or "不可能" in val:
-                        return key
-                return "B"
-            
-            # 複数の Yes がある場合は、以前の安定性スコアで絞り込むことも可能だが、まずはシンプルに
-            return max(scores, key=scores.get)
+        if not options: return "B"
 
-        # 判定ルール（研究用フォールバック）
-        if csi < 0.01 and cii < 1.0:
-            return "B"
-        elif cii > 10.0:
-            return "A"
-        else:
-            return "C"
+        P_expected = expected_primitives(phenom, csi, cii, impossible)
+        scores = {}
+        for key, outcome in options.items():
+            P_opt = CausalPrimitiveEncoder.encode(outcome)
+            dist = primitive_distance(P_opt, P_expected)
+            scores[key] = -dist
+            print(f"Option {key}: primitives={P_opt}, score={-dist:.4f}")
+
+        return max(scores.items(), key=lambda x: x[1])[0]
 
 
 # ==========================================================
@@ -536,10 +509,8 @@ Is this logical? Answer: Yes or No"""
 # ==========================================================
 if __name__ == "__main__":
     osys = UnifiedCausalOS()
-
     answer = osys.solve_counterfactual(
         "A man walks on a street.",
         "What would have happened if a man had walked on a bed?"
     )
-
     print(f"\nFinal Answer: <Answer>{answer}</Answer>")
