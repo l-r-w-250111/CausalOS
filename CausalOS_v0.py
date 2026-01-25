@@ -101,13 +101,13 @@ class LLMCausalObserver:
         phi = self.calculate_phi(logits)
         self.phi_history.append(phi)
         cii = self.calculate_cii()
-
+        
         entropy = self.calculate_entropy(logits)
         top1_prob = self.calculate_top1_prob(logits)
         kurtosis = self.calculate_kurtosis(logits)
 
         next_token = torch.argmax(logits).item()
-
+        
         metrics = {
             "phi": phi,
             "cii": cii,
@@ -115,15 +115,49 @@ class LLMCausalObserver:
             "top1_prob": top1_prob,
             "kurtosis": kurtosis
         }
-
+        
         return next_token, metrics, logits
 
 
 # ==========================================================
-# 2) 因果ダイナミクス：CausalCore（複素位相＋attention-like伝播）
+# 2) 因果ダイナミクス：ISAExecutor + CausalCore
 # ==========================================================
+class ISAExecutor:
+    """
+    Atomic Intervention (ISA) Graph Logic
+    """
+    @staticmethod
+    def execute(S, r_scale, phi_shift, omega_eff, sequence, label_map):
+        for op_data in sequence:
+            if not isinstance(op_data, dict): continue
+            op = op_data.get("op")
+            args = op_data.get("args", [])
+            
+            if op == "DELETE":
+                src_l, dst_l = args
+                for i in label_map.get(src_l, []):
+                    for j in label_map.get(dst_l, []):
+                        S[i, j] = 0.0
+            elif op == "INSERT":
+                src_l, dst_l = args
+                for i in label_map.get(src_l, []):
+                    for j in label_map.get(dst_l, []):
+                        S[i, j] = 1.0
+            elif op == "SCALE_GAIN":
+                label, alpha = args
+                for i in label_map.get(label, []):
+                    r_scale[:, i] *= float(alpha)
+            elif op == "DELAY":
+                label, dt = args
+                for i in label_map.get(label, []):
+                    phi_shift[:, i] += float(dt)
+            elif op == "PERMUTE":
+                p = torch.randperm(S.shape[0])
+                S.copy_(S[p][:, p] * 1.5)
+        return S, r_scale, phi_shift, omega_eff
+
 class CausalCore(nn.Module):
-    def __init__(self, n_vars=5, d_model=128, K=2):
+    def __init__(self, n_vars=10, d_model=128, K=2):
         super().__init__()
         self.n_vars = n_vars
         self.K = K
@@ -154,7 +188,7 @@ class CausalCore(nn.Module):
         diag = torch.eye(self.n_vars, device=S.device)
         return S * (1 - diag) + diag * 0.95
 
-    def forward(self, x_2ch, history_flat, epoch=2500, do_mask=None, atomic_interventions=None, t=0):
+    def forward(self, x_2ch, history_flat, epoch=2500, do_mask=None, atomic_interventions=None, label_map=None, t=0):
         """
         x_{j}(t+1) = sigma( sum_i S_ij * r_ij * e^{i(phi_ij + omega*t)} * x_i(t) )
         """
@@ -172,41 +206,16 @@ class CausalCore(nn.Module):
         ], dim=1)
 
         S = self._get_S_core(epoch)
-
-        # --- 原子操作 (Atomic Interventions) の適用 ---
-        r_scale = torch.ones_like(S)
-        phi_shift = torch.zeros_like(S)
+        
+        # --- 原子操作 (ISA) の適用 ---
+        r_scale = torch.ones_like(S).unsqueeze(0).repeat(B, 1, 1)
+        phi_shift = torch.zeros_like(S).unsqueeze(0).repeat(B, 1, 1)
         omega_eff = self.omega.clone()
-
-        if atomic_interventions:
-            # 1) Delete/Insert (Structure)
-            if 'delete' in atomic_interventions:
-                for i, j in atomic_interventions['delete']:
-                    S[i, j] = 0.0
-            if 'insert' in atomic_interventions:
-                for i, j in atomic_interventions['insert']:
-                    S[i, j] = 1.0
-
-            # 2) Scale (Intensity)
-            if 'scale' in atomic_interventions:
-                for i, j, alpha in atomic_interventions['scale']:
-                    r_scale[i, j] *= alpha
-
-            # 3) Invert (Polarity)
-            if 'invert' in atomic_interventions:
-                for i, j in atomic_interventions['invert']:
-                    phi_shift[i, j] += np.pi
-
-            # 4) Delay (Tense/Frequency)
-            if 'delay_omega' in atomic_interventions:
-                omega_eff += atomic_interventions['delay_omega']
-
-            # 5) Permute (Logical Structure / Non-Hermitian)
-            if 'permute' in atomic_interventions:
-                for i, j in atomic_interventions['permute']:
-                    tmp = S[i, j].clone()
-                    S[i, j] = S[j, i]
-                    S[j, i] = tmp * 2.0 # 発散を誘発
+        
+        if atomic_interventions and label_map:
+            S, r_scale, phi_shift, omega_eff = ISAExecutor.execute(
+                S, r_scale, phi_shift, omega_eff, atomic_interventions, label_map
+            )
 
         self_loop_mask = torch.eye(self.n_vars, device=S.device)
 
@@ -217,12 +226,12 @@ class CausalCore(nn.Module):
 
         for k in range(self.K):
             w_k = (1.0 - self_loop_mask) if k == 0 else self_loop_mask
-            theta = (self.raw_phase.unsqueeze(0)
-                     + phi_curr[:, k].view(B, 1, 1)
-                     + phi_shift.unsqueeze(0)
+            theta = (self.raw_phase.unsqueeze(0) 
+                     + phi_curr[:, k].view(B, 1, 1) 
+                     + phi_shift
                      + omega_eff * t)
-
-            A = S.unsqueeze(0) * w_k * r_mode[:, k].view(B, 1, 1) * r_scale.unsqueeze(0)
+            
+            A = S.unsqueeze(0) * w_k * r_mode[:, k].view(B, 1, 1) * r_scale
 
             if do_mask is not None:
                 A = A * do_mask.unsqueeze(2)
@@ -261,6 +270,38 @@ class CausalMetrics:
         return alpha * torch.mean(torch.abs(d2_edge)).item() + \
                (1-alpha) * torch.mean(torch.abs(d2_node)).item()
 
+    @staticmethod
+    def compute_responsiveness(phi_traj):
+        """
+        介入後のノードが『動いているか』を測る。
+        変化（速度）がないものは、反実仮想の帰結として不適切。
+        """
+        d_phi = phi_traj[1:] - phi_traj[:-1]
+        return torch.mean(torch.abs(d_phi)).item()
+
+    @staticmethod
+    def compute_alignment(intervention_isa, option_isa):
+        """
+        介入の意図(DELETE/NEGATION)とオプションのISAの論理的整合性を簡易チェック
+        """
+        def get_ops(isa):
+            ops = []
+            for item in isa:
+                if isinstance(item, dict) and 'op' in item:
+                    ops.append(item['op'])
+            return ops
+
+        int_ops = get_ops(intervention_isa)
+        opt_ops = get_ops(option_isa)
+        
+        # 介入が削除系(DELETE)で、オプションが挿入系(INSERT)なら、補償行動として高評価
+        if ("DELETE" in int_ops or "SCALE_GAIN" in int_ops) and "INSERT" in opt_ops:
+            return 2.0 
+        # 介入が不可能事象で、オプションがPERMUTEなら高評価
+        if "PERMUTE" in int_ops and "PERMUTE" in opt_ops:
+            return 3.0
+        return 1.0
+
 
 # ==========================================================
 # 4) S行列エンジン：事実の剛性誘導
@@ -282,71 +323,6 @@ class SMatrixEngine:
         return logits
 
 
-# ==========================================================
-# 5) 追加ユーティリティ：Causal Primitive Encoder
-# ==========================================================
-class CausalPrimitiveEncoder:
-    """
-    Convert a natural language outcome into a causal primitive vector
-    """
-    @staticmethod
-    def encode(text: str):
-        t = text.lower()
-        prim = {
-            "substitution": 0.0,
-            "negation": 0.0,
-            "intensity": 0.0,
-            "tense": 0.0,
-            "impossibility": 0.0
-        }
-        if any(w in t for w in ["instead", "replace", "changed into"]):
-            prim["substitution"] = 1.0
-        if any(w in t for w in ["not", "never", "didn't", "failed to"]):
-            prim["negation"] = 1.0
-        if any(w in t for w in ["more", "faster", "heavier", "stronger"]):
-            prim["intensity"] = 1.0
-        elif any(w in t for w in ["less", "slower", "weaker"]):
-            prim["intensity"] = -1.0
-        if any(w in t for w in ["earlier", "before"]):
-            prim["tense"] = -1.0
-        elif any(w in t for w in ["later", "after"]):
-            prim["tense"] = 1.0
-        if any(w in t for w in ["impossible", "cannot", "category error", "nonsense", "not possible", "不可能"]):
-            prim["impossibility"] = 1.0
-        return prim
-
-def expected_primitives(phenom, csi, cii, impossible):
-    p = {
-        "substitution": 0.0,
-        "negation": 0.0,
-        "intensity": 0.0,
-        "tense": 0.0,
-        "impossibility": 0.0
-    }
-    if phenom == "SUBSTITUTION":
-        p["substitution"] = 1.0
-    elif phenom == "NEGATION":
-        p["negation"] = 1.0
-    elif phenom == "INTENSITY":
-        p["intensity"] = 1.0
-    elif phenom == "TENSE":
-        p["tense"] = 1.0
-    elif phenom == "IMPOSSIBILITY":
-        p["impossibility"] = 1.0
-
-    if impossible or cii > 1e3:
-        p["impossibility"] = 1.0
-    if csi < 0.01:
-        p["negation"] *= 0.5
-    return p
-
-def primitive_distance(p1, p2):
-    v1 = np.array(list(p1.values()), dtype=np.float32)
-    v2 = np.array(list(p2.values()), dtype=np.float32)
-    return np.linalg.norm(v1 - v2)
-
-
-# ==========================================================
 # 6) 統合OS：Unified CausalOS
 # ==========================================================
 class UnifiedCausalOS:
@@ -356,18 +332,11 @@ class UnifiedCausalOS:
         self.metrics = CausalMetrics()
         self.s_matrix = SMatrixEngine()
         self.node_extractor = CausalNodeExtractor(
-            model=self.observer.model,
+            model=self.observer.model, 
             tokenizer=self.observer.tokenizer
         )
         self.causal_core.eval()
-
-        self.mapping = {
-            "man": 0,
-            "walk": 1,
-            "street": 2,
-            "bed": 3,
-            "destination": 4
-        }
+        self.label_cache = {}
 
     def reset(self):
         self.observer.reset()
@@ -376,11 +345,11 @@ class UnifiedCausalOS:
         self.observer.reset()
         input_ids = self.observer.tokenizer(text, return_tensors="pt").to(device).input_ids
         ents, ciis = [], []
-
+        
         next_tok, metrics, _ = self.observer.step(input_ids)
         ents.append(metrics['entropy'])
         ciis.append(metrics['cii'])
-
+        
         curr_ids = input_ids
         for _ in range(steps):
             curr_ids = torch.cat([curr_ids, torch.tensor([[next_tok]]).to(device)], dim=-1)
@@ -402,32 +371,196 @@ class UnifiedCausalOS:
 
         return int(np.argmax(np.abs(cii_traj)))
 
-    def rollout_with_intervention(self, initial_energy=0.5, atomic_interventions=None, horizon=20):
+    def rollout_with_intervention(self, initial_energy=0.5, atomic_interventions=None, label_map=None, horizon=10):
         x = torch.zeros(1, self.causal_core.n_vars, 2, device=device)
-        x[0, :, 0] = initial_energy
+        x[0, :, 0] = initial_energy 
         hist = torch.zeros(1, self.causal_core.n_vars, device=device)
         phi_history = []
 
         for t in range(horizon):
             with torch.no_grad():
-                x, phi = self.causal_core(x, hist, atomic_interventions=atomic_interventions, t=t)
+                x, phi = self.causal_core(x, hist, atomic_interventions=atomic_interventions, label_map=label_map, t=t)
             phi_history.append(phi.mean())
             hist = x[:, :, 0]
         return torch.stack(phi_history)
 
+    def generate_intervention_isa(self, factual, counterfactual, label_graph):
+        """
+        Generate ISA for the counterfactual intervention part.
+        Uses 2-stage reasoning for universality.
+        """
+        labels = [l['name'] for l in label_graph.get("labels", [])]
+        if not labels:
+            labels = ["something"]
+
+        # ============================
+        # Stage 1: Intervention logic explanation
+        # ============================
+        explain_prompt = f"""
+Factual world: {factual}
+Counterfactual condition: {counterfactual}
+
+Explain how the counterfactual condition breaks or modifies the factual causal chain.
+Identify which entity or action is suppressed, replaced, or added.
+Answer in 1-2 sentences.
+"""
+        explanation = self.generate_short(explain_prompt, max_new_tokens=80)
+
+        # ============================
+        # Stage 2: ISA construction
+        # ============================
+        isa_prompt = f"""
+Causal logic: {explanation}
+Available labels: {labels}
+
+Task: Translate this intervention into ISA operations.
+Ops: DELETE(src, dst), INSERT(src, dst), SCALE_GAIN(label, alpha), DELAY(label, dt), PERMUTE()
+
+Return ONLY a JSON list.
+JSON:
+"""
+        raw = self.generate_short(isa_prompt, max_new_tokens=150)
+
+        try:
+            match = re.search(r'(\[.*\])', raw, re.DOTALL)
+            if match:
+                isa = json.loads(match.group(1))
+                if isinstance(isa, list) and len(isa) > 0:
+                    return isa
+        except Exception:
+            pass
+
+        # Deterministic fallback
+        t = counterfactual.lower()
+        if " not " in t or "n't " in t or "didn't" in t:
+            return [{"op": "SCALE_GAIN", "args": [labels[0], 0.0]}]
+        
+        return [{"op": "SCALE_GAIN", "args": [labels[-1], 0.5]}]
+
+    def generate_option_isa(self, factual, counterfactual, option_text, label_graph):
+        """
+        Generate ISA (atomic intervention sequence) for EACH option.
+        Always returns a non-empty ISA list.
+        """
+
+        labels = [l['name'] for l in label_graph.get("labels", [])]
+        if not labels:
+            labels = ["something"]
+
+        # ============================
+        # Stage 1: causal explanation
+        # ============================
+        explain_prompt = f"""
+Factual world:
+{factual}
+
+Counterfactual condition:
+{counterfactual}
+
+Candidate outcome:
+{option_text}
+
+Explain the CAUSAL reasoning that connects the counterfactual condition
+to the candidate outcome.
+
+Focus on:
+- What FAILED or changed?
+- Does this outcome introduce a NEW action or event?
+- Is this action a compensation or follow-up?
+- Is the effect stronger, weaker, delayed, or impossible?
+
+Answer in 1–3 sentences.
+"""
+        explanation = self.generate_short(explain_prompt, max_new_tokens=120)
+
+        # ============================
+        # Stage 2: ISA construction
+        # ============================
+        isa_prompt = f"""
+Causal explanation:
+{explanation}
+
+Available labels (existing entities or actions):
+{labels}
+
+Task:
+Translate the causal consequence into ATOMIC OPERATIONS.
+
+Atomic operations:
+- DELETE(src, dst): remove causal influence
+- INSERT(src, dst): introduce a NEW action or event
+- SCALE_GAIN(label, alpha): change intensity (0.0 = suppressed, >1.0 = stronger)
+- DELAY(label, dt): temporal delay
+- PERMUTE(): logical or category impossibility
+
+Rules:
+- If a NEW action/event appears, you MUST use INSERT.
+- Compensation after failure should INCREASE intensity.
+- If outcome states "nothing happens", suppress influence.
+- If outcome is impossible or nonsensical, use PERMUTE.
+- Return ONLY a JSON list.
+
+JSON:
+"""
+        raw = self.generate_short(isa_prompt, max_new_tokens=200)
+
+        # ============================
+        # JSON extraction
+        # ============================
+        try:
+            match = re.search(r'(\[.*\])', raw, re.DOTALL)
+            if match:
+                isa = json.loads(match.group(1))
+                if isinstance(isa, list) and len(isa) > 0:
+                    return isa
+        except Exception:
+            pass
+
+        # ============================
+        # Deterministic fallback (ALWAYS returns ISA)
+        # ============================
+        t = option_text.lower()
+
+        # --- Impossibility ---
+        if any(w in t for w in ["not possible", "impossible", "nonsense", "cannot", "category error"]):
+            return [{"op": "PERMUTE", "args": []}]
+
+        # --- Negation / nothing happens ---
+        if any(w in t for w in ["nothing", "no effect", "did not happen", "never"]):
+            return [{"op": "SCALE_GAIN", "args": [labels[0], 0.0]}]
+
+        # --- Compensation / follow-up action ---
+        if any(w in t for w in ["need to", "had to", "would have to", "study", "prepare", "practice"]):
+            # introduce a new action node implicitly
+            return [
+                {"op": "INSERT", "args": [labels[0], "compensatory_action"]},
+                {"op": "SCALE_GAIN", "args": ["compensatory_action", 1.5]}
+            ]
+
+        # --- Intensity change ---
+        if any(w in t for w in ["more", "stronger", "harder", "faster"]):
+            return [{"op": "SCALE_GAIN", "args": [labels[0], 1.5]}]
+
+        if any(w in t for w in ["less", "weaker", "slower"]):
+            return [{"op": "SCALE_GAIN", "args": [labels[0], 0.5]}]
+
+        # --- Default: weak but valid continuation ---
+        return [{"op": "SCALE_GAIN", "args": [labels[0], 1.0]}]
+
     def classify_phenomenology(self, factual, cf):
-        prompt = f"""Classify the type of counterfactual intervention between these two sentences.
+        t = cf.lower()
+        # 強力なキーワードベースの分類（LLMの不安定さを補う）
+        if any(w in t for w in [" not ", "n't ", " never ", " failed to "]):
+            return "NEGATION"
+        if any(w in t for w in [" more ", " less ", " faster ", " slower ", " heavier ", " weaker "]):
+            return "INTENSITY"
+        if any(w in t for w in [" earlier ", " before ", " later ", " after "]):
+            return "TENSE"
+        
+        prompt = f"""Classify the type of counterfactual intervention.
 Factual: {factual}
 Counterfactual: {cf}
-
-Categories:
-1. SUBSTITUTION: A is replaced by B
-2. NEGATION: A is negated (e.g., 'not')
-3. INTENSITY: Degree or speed changes (e.g., 'more', 'fast')
-4. TENSE: Time or order changes (e.g., 'earlier', 'after')
-5. IMPOSSIBILITY: Logic error or paradox
-
-Return only the category name.
+Categories: SUBSTITUTION, NEGATION, INTENSITY, TENSE, IMPOSSIBILITY
 Result:"""
         category = self.generate_short(prompt, max_new_tokens=5).strip().upper()
         for cat in ["SUBSTITUTION", "NEGATION", "INTENSITY", "TENSE", "IMPOSSIBILITY"]:
@@ -458,50 +591,80 @@ Result:"""
         return self.observer.tokenizer.decode(generated_ids, skip_special_tokens=True)
 
     def solve_counterfactual(self, factual, cf, options=None):
-        print("\n=== Unified CausalOS ===")
-        phenom = self.classify_phenomenology(factual, cf)
-        print(f"[CausalOS] Phenomenology: {phenom}")
+        print("\n=== Unified CausalOS (ISA Graph Mode) ===")
+        
+        # 1. Label Extraction (with Caching)
+        if factual in self.label_cache:
+            label_graph = self.label_cache[factual]
+        else:
+            label_graph = self.node_extractor.extract_label_graph(factual)
+            self.label_cache[factual] = label_graph
 
-        nodes_f = self.node_extractor.extract_nodes(factual)
-        nodes_c = self.node_extractor.extract_nodes(cf)
-        self.mapping = {node: i for i, node in enumerate(nodes_f[:self.causal_core.n_vars])}
+        if not label_graph.get("labels"):
+            label_graph = {"labels": [{"name": "something", "nodes": 2}], "edges": []}
+            
+        # 2. Map Labels to Node Indices and Ground Topology
+        label_map = {}
+        curr_idx = 0
+        for label in label_graph["labels"]:
+            n = label.get("nodes", 2)
+            label_map[label["name"]] = list(range(curr_idx, min(self.causal_core.n_vars, curr_idx + n)))
+            curr_idx += n
+        
+        # Reserve remaining nodes for virtual labels like "compensatory_action"
+        if curr_idx < self.causal_core.n_vars:
+            label_map["compensatory_action"] = list(range(curr_idx, self.causal_core.n_vars))
+            
+        # Grounding: Initialize topology based on extracted edges
+        with torch.no_grad():
+            self.causal_core.raw_S.zero_()
+            for edge in label_graph.get("edges", []):
+                src_nodes = label_map.get(edge["src"], [])
+                dst_nodes = label_map.get(edge["dst"], [])
+                for s in src_nodes:
+                    for d in dst_nodes:
+                        if s < self.causal_core.n_vars and d < self.causal_core.n_vars:
+                            self.causal_core.raw_S[s, d] = 1.0
 
-        removed = [n for n in nodes_f if n.lower() not in [nc.lower() for nc in nodes_c]]
-        orig_node = removed[0] if removed else nodes_f[-1]
-        do_idx = self.mapping.get(orig_node, 0)
-
-        atomic_int = {}
-        if phenom == "SUBSTITUTION":
-            atomic_int["delete"] = [(i, do_idx) for i in range(self.causal_core.n_vars)]
-        elif phenom == "NEGATION":
-            atomic_int["invert"] = [(i, do_idx) for i in range(self.causal_core.n_vars)]
-        elif phenom == "INTENSITY":
-            atomic_int["scale"] = [(i, do_idx, 2.0) for i in range(self.causal_core.n_vars)]
-        elif phenom == "TENSE":
-            atomic_int["delay_omega"] = 0.5
-        elif phenom == "IMPOSSIBILITY":
-            atomic_int["permute"] = [(do_idx, (do_idx + 1) % self.causal_core.n_vars)]
-
-        self.observer.reset()
-        _, f_metrics, _ = self.observer.step(self.observer.tokenizer(factual, return_tensors="pt").to(device).input_ids)
-        initial_energy = min(1.0, f_metrics["phi"] / 50.0)
-        phi_traj = self.rollout_with_intervention(initial_energy=initial_energy, atomic_interventions=atomic_int)
-        csi = self.metrics.compute_CSI(phi_traj.unsqueeze(0))
-        cii = self.metrics.compute_CII(phi_traj)
-        impossible = torch.isnan(phi_traj).any() or cii > 1e4 or phenom == "IMPOSSIBILITY"
-        print(f"Causal Rollout: CSI={csi:.4e}, CII={cii:.4e}, Impossible={impossible}")
-
+        # 3. Generate Intervention ISA
+        intervention_isa = self.generate_intervention_isa(factual, cf, label_graph)
+        if not intervention_isa:
+            print("[Error] Could not represent intervention as ISA combination.")
+            return "B"
+            
+        # 4. Evaluation
         if not options: return "B"
-
-        P_expected = expected_primitives(phenom, csi, cii, impossible)
+        
         scores = {}
-        for key, outcome in options.items():
-            P_opt = CausalPrimitiveEncoder.encode(outcome)
-            dist = primitive_distance(P_opt, P_expected)
-            scores[key] = -dist
-            print(f"Option {key}: primitives={P_opt}, score={-dist:.4f}")
+        for key, text in options.items():
+            option_isa = self.generate_option_isa(factual, cf, text, label_graph)
+            combined_isa = intervention_isa + option_isa
+            
+            # Simulate
+            self.observer.reset()
+            phi_traj = self.rollout_with_intervention(
+                initial_energy=0.5, 
+                atomic_interventions=combined_isa, 
+                label_map=label_map
+            )
+            
+            # --- 新しいスコアリングロジック ---
+            # 1. 反応性: 介入によってどれだけ「意味のある変化」が起きたか
+            resp = self.metrics.compute_responsiveness(phi_traj)
+            
+            # 2. 論理整合性: 介入とオプションのISAの組み合わせ評価
+            align = self.metrics.compute_alignment(intervention_isa, option_isa)
+            
+            # 3. 安定性 (CSI): 依然として必要だが、これだけで決めない
+            csi = self.metrics.compute_CSI(phi_traj.unsqueeze(0))
+            stability = 1.0 / (csi + 1e-4) # ゼロ除算回避
 
-        return max(scores.items(), key=lambda x: x[1])[0]
+            # 合計スコア: 「変化の大きさ」と「論理の正しさ」を重視
+            score = resp * align * (stability ** 0.5)
+            scores[key] = score
+            print(f"Option {key}: Resp={resp:.4f}, Align={align}, Score={score:.2f}")
+            
+        return max(scores, key=scores.get)
 
 
 # ==========================================================
