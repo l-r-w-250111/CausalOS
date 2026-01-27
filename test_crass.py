@@ -1,4 +1,4 @@
-from CausalOS_v0 import UnifiedCausalOS
+from CausalOS_v1 import UnifiedCausalOSV1 as UnifiedCausalOS
 import torch
 
 def test_crass():

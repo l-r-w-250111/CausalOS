@@ -1,4 +1,4 @@
-from CausalOS_v0 import UnifiedCausalOS
+from CausalOS_v1 import UnifiedCausalOSV1 as UnifiedCausalOS
 import torch
 
 def test_paper_hallucination():
@@ -8,7 +8,7 @@ def test_paper_hallucination():
     # 1. Register a "factual" paper title in the S-Matrix
     # Using a real paper to simulate a "known fact"
     paper_title = "Attention Is All You Need"
-    token_ids = osys.observer.tokenizer.encode(paper_title, add_special_tokens=False)
+    token_ids = osys.tokenizer.encode(paper_title, add_special_tokens=False)
     osys.s_matrix.register_sequence(token_ids, rigidity=100.0)
     
     print(f"Registered factual sequence for: '{paper_title}'")
@@ -21,7 +21,7 @@ def test_paper_hallucination():
     
     # Generate with causal check
     # We set a low hesitation threshold to ensure S-Matrix is triggered for demonstration
-    output = osys.generate_with_causal_check(prompt, max_new_tokens=10, hesitation_threshold=0.1)
+    output = osys.generate_with_causal_check(prompt, max_new_tokens=10, hesitation_threshold=0.0)
     
     print(f"\nGenerated Output: {output}")
     
