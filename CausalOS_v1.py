@@ -6,7 +6,18 @@ import re, os, json, uuid
 from collections import defaultdict
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+try:
+    if torch.cuda.is_available():
+        # Test CUDA availability
+        torch.zeros(1).cuda()
+        device = torch.device("cuda")
+        print(f"[System] Using CUDA device: {torch.cuda.get_device_name(0)}")
+    else:
+        device = torch.device("cpu")
+        print("[System] Using CPU device")
+except:
+    device = torch.device("cpu")
+    print("[System] CUDA available but error occurred. Falling back to CPU.")
 
 # ==========================================================
 # 1) 物理コア (V1): 拡張可能な複素位相ダイナミクス
@@ -39,6 +50,19 @@ class CausalCoreV1(nn.Module):
         
         self.n_nodes = new_n
         print(f"[Core] Expanded to {new_n} nodes.")
+    
+    def set_node_state_from_physics(self, node_idx, rigidity, support, harm):
+        """物理属性からノード状態を設定"""
+        if node_idx >= self.n_nodes:
+            return
+        
+        # 物理属性を複素数状態にマッピング（スケール強化）
+        # real: harm + rigidity の組み合わせ（物質的特性）
+        # imag: support（相互作用の強さ）
+        # ×2でより大きな初期状態差を作る
+        with torch.no_grad():
+            self.x.data[node_idx, 0] = (harm + rigidity * 0.5) * 2.0  # real部（強化）
+            self.x.data[node_idx, 1] = support * 2.0  # imaginary部（強化）
 
     def forward(self, x_in=None, gate=None, gain=None, t=0):
         S = torch.tanh(self.raw_S)
@@ -390,6 +414,141 @@ Answer:"""
             outputs = self.model.generate(**inputs, max_new_tokens=tokens, do_sample=False, pad_token_id=self.tokenizer.eos_token_id)
         return self.tokenizer.decode(outputs[0][inputs.input_ids.shape[-1]:], skip_special_tokens=True)
 
+    # ==========================================================
+    # 物理ベースの反事実評価メソッド
+    # ==========================================================
+    def _create_intervention_params(self, original_idx, replacement_idx, harm_change, support_change=0.0, rigidity_change=0.0):
+        """介入を物理パラメータ(gate, gain)に変換"""
+        gate = torch.ones(self.n_nodes, self.n_nodes, device=device)
+        gain = torch.ones(self.n_nodes, self.n_nodes, device=device)
+        
+        # 置換: original→0, replacement→1 (トポロジー書換)
+        if original_idx < self.n_nodes and replacement_idx < self.n_nodes:
+            gate[:, original_idx] = 0.0  # originalへの入力を切断
+            gate[original_idx, :] = 0.0  # originalからの出力を切断
+        
+        # 振幅変調: 物理属性の変化を総合的に反映
+        # harm(有害性), support(質量/エネルギー), rigidity(硬さ) の変化
+        impact_factor = abs(harm_change) * 10.0 + abs(support_change) * 5.0 + abs(rigidity_change) * 3.0
+        
+        gain_factor = torch.exp(torch.tensor(impact_factor, device=device))
+        gain *= gain_factor
+        
+        return gate, gain
+    
+    def _simulate_counterfactual(self, gate, gain, steps=20):
+        """物理コアで反事実シミュレーション（ステップ数増加）"""
+        trajectory = []
+        x = self.core.x.clone().detach()
+        
+        with torch.no_grad():
+            for t in range(steps):
+                x = self.core.forward(x, gate=gate, gain=gain, t=t)
+                trajectory.append(x.clone())
+        
+        return torch.stack(trajectory)  # [steps, n_nodes, 2]
+    
+    def _extract_trajectory_signature(self, trajectory_baseline, trajectory_cf):
+        """軌道から物理的特徴を抽出 (do-calculus: 介入の影響を差分で測定)"""
+        with torch.no_grad():
+            # 介入の影響 = counterfactual - baseline
+            impact = trajectory_cf - trajectory_baseline  # [steps, n_nodes, 2]
+            
+            # 影響の大きさ (ノルム)
+            impact_magnitude = torch.norm(impact, dim=-1)  # [steps, n_nodes]
+            total_impact = impact_magnitude.mean().item()  # 平均的な影響
+            
+            # 位相変化（介入による位相シフト）
+            phases_baseline = torch.atan2(trajectory_baseline[:, :, 1], trajectory_baseline[:, :, 0])
+            phases_cf = torch.atan2(trajectory_cf[:, :, 1], trajectory_cf[:, :, 0])
+            phase_shift = torch.abs(phases_cf - phases_baseline).mean().item()
+            
+            # 振幅変化
+            amp_baseline = torch.norm(trajectory_baseline, dim=-1)
+            amp_cf = torch.norm(trajectory_cf, dim=-1)
+            amplitude_change = torch.abs(amp_cf - amp_baseline).mean().item()
+            
+            # 安定性 (影響の時間的分散)
+            impact_variance = torch.var(impact_magnitude).item()
+            stability = 1.0 / (impact_variance + 1e-5)
+            
+        return {
+            'total_impact': total_impact,
+            'phase_shift': phase_shift,
+            'amplitude_change': amplitude_change,
+            'stability': stability
+        }
+    
+    def _extract_severity_from_text(self, text):
+        """LLMを使って文章から重大度を抽出 (0-1)"""
+        prompt = f"""Rate the severity/seriousness of this outcome on a scale of 0.0 to 1.0:
+"{text}"
+
+0.0 = not serious at all (e.g., "nothing happened", "everything was fine")
+0.3 = minor concern (e.g., "slightly inconvenient", "a bit risky")
+0.5 = moderate concern (e.g., "dangerous", "problematic", "illegal")
+0.8 = very serious (e.g., "severe injury", "major damage")
+1.0 = catastrophic (e.g., "death", "complete destruction")
+
+Answer with just a number between 0.0 and 1.0:
+<severity>X.X</severity>"""
+        
+        response = self.generate_short(prompt, tokens=20)
+        
+        # 数値抽出
+        match = re.search(r"<severity>([\d.]+)</severity>", response)
+        if match:
+            try:
+                severity = float(match.group(1))
+                return max(0.0, min(1.0, severity))  # 0-1にクリップ
+            except:
+                pass
+        
+        # フォールバック: 数値を直接探す
+        numbers = re.findall(r"(\d+\.?\d*)", response)
+        if numbers:
+            try:
+                severity = float(numbers[0])
+                # 0-1範囲に正規化
+                if severity > 1.0:
+                    severity = severity / 10.0 if severity <= 10.0 else 1.0
+                return max(0.0, min(1.0, severity))
+            except:
+                pass
+        
+        # デフォルト
+        return 0.5
+
+    def _scale_impact_to_severity(self, total_impact, harm_change, rigidity_change=0.0, support_change=0.0):
+        """物理影響量を意味的重大度にマッピング（汎用関数）
+        
+        物理的変化量と意味的重大度の間のスケール不一致を解決。
+        問題に依存しない汎用的なマッピング。
+        """
+        # 基準: 物理的変化量から期待重大度を推定
+        # harm ±0.1 → moderate (0.3-0.5)
+        # harm ±0.2 → serious (0.5-0.7)
+        # harm ±0.5 → severe (0.7-0.9)
+        base_severity = abs(harm_change) * 3.0
+        
+        # rigidityの変化も考慮（脆さ↑ → 危険性↑）
+        rigidity_factor = abs(rigidity_change) * 1.0
+        
+        # supportの変化も考慮（質量/エネルギー↑ → 衝撃↑）
+        # 鳥(0.5) vs 飛行機(1.0) のような差を反映
+        support_factor = abs(support_change) * 1.0
+        
+        # シミュレーション結果で微調整
+        # total_impact大 → さらに増幅（複雑な相互作用を反映）
+        simulation_factor = min(0.3, total_impact * 2.0)
+        
+        # 合成
+        expected_severity = base_severity + rigidity_factor + support_factor + simulation_factor
+        
+        # 0-1にクリップ
+        return max(0.0, min(1.0, expected_severity))
+
+
     def solve_counterfactual(self, factual, cf, options=None):
         print(f"\n[OS] Counterfactual Reasoning")
         print(f"Factual: {factual}")
@@ -472,63 +631,82 @@ Answer:"""
         if not options:
             return "Discovery mode"
         
-        # Step 6: 選択肢評価（シンプルかつ直接的）
+        # Step 6: 物理ベースの選択肢評価
+        print("[OS] Using physics-based evaluation...")
+        
+        # 6.1: 介入をgate/gainに変換
+        original_idx = self.label_to_idx.get(original, 0)
+        replacement_idx = self.label_to_idx.get(replacement, 0)
+        harm_change = replacement_props["harm"] - original_props["harm"]
+        
+        # 6.1.5: CausalCoreに物理属性を反映（重要！）
+        # これにより、抽象的な物理シミュレーションが具体的な概念の物理特性を持つ
+        print(f"[OS] Initializing CausalCore states from physical properties...")
+        self.core.set_node_state_from_physics(
+            original_idx,
+            original_props["rigidity"],
+            original_props["support"],
+            original_props["harm"]
+        )
+        self.core.set_node_state_from_physics(
+            replacement_idx,
+            replacement_props["rigidity"],
+            replacement_props["support"],
+            replacement_props["harm"]
+        )
+        
+        support_change = replacement_props["support"] - original_props["support"]
+        rigidity_change = replacement_props["rigidity"] - original_props["rigidity"]
+        
+        gate, gain = self._create_intervention_params(original_idx, replacement_idx, harm_change, support_change, rigidity_change)
+        
+        # 6.2: 物理シミュレーション (do-calculus: baseline vs counterfactual)
+        # ベースライン（介入なし）
+        gate_baseline = torch.ones(self.n_nodes, self.n_nodes, device=device)
+        gain_baseline = torch.ones(self.n_nodes, self.n_nodes, device=device)
+        trajectory_baseline = self._simulate_counterfactual(gate_baseline, gain_baseline, steps=20)
+        
+        # 反事実（介入あり）
+        trajectory_cf = self._simulate_counterfactual(gate, gain, steps=20)
+        
+        # 6.3: 介入の影響を測定
+        signature = self._extract_trajectory_signature(trajectory_baseline, trajectory_cf)
+        
+        # 物理量を意味的重大度にスケーリング（汎用マッピング）
+        expected_severity = self._scale_impact_to_severity(
+            signature['total_impact'],
+            harm_change,
+            rigidity_change,
+            support_change
+        )
+        
+        print(f"Physics signature: total_impact={signature['total_impact']:.3f}, amplitude_change={signature['amplitude_change']:.3f}")
+        print(f"Scaled expected severity: {expected_severity:.3f} (from harm={harm_change:.2f}, support={support_change:.2f})")
+        
+        # 6.4: 各選択肢を評価
         scores = {}
         
         for key, outcome in options.items():
             print(f"\n  [Option {key}] {outcome}")
             
-            # 物理属性に基づく予測
-            physical_score = 0.0
+            # メタ否定の検出（事前フィルタ）
+            if "wouldn't" in outcome.lower() or "won't" in outcome.lower() or "cannot" in outcome.lower():
+                scores[key] = 0.1
+                print(f"    Meta-denial detected, Score: 0.10/10")
+                continue
             
-            # 有害性チェック
-            if replacement_props["harm"] > 0.5:
-                if "broken" in outcome.lower() or "hurt" in outcome.lower() or "suffer" in outcome.lower():
-                    physical_score += 2.0
-                if "happy" in outcome.lower() or "nothing" in outcome.lower():
-                    physical_score -= 2.0
+            # LLMで選択肢の重大度を抽出
+            extracted_severity = self._extract_severity_from_text(outcome)
             
-            # サポート性チェック
-            if original_props["support"] > 0.7 and replacement_props["support"] < 0.3:
-                if "late" in outcome.lower() or "difficult" in outcome.lower():
-                    physical_score += 1.0
-                if "on time" in outcome.lower():
-                    physical_score -= 1.0
+            # 物理的期待値とのマッチング
+            distance = abs(extracted_severity - expected_severity)
+            score = 10.0 / (1.0 + distance * 10.0)  # 0-10のスコア
             
-            # 剛性の変化
-            rigidity_change = abs(original_props["rigidity"] - replacement_props["rigidity"])
-            if rigidity_change > 0.3:
-                if "nothing" in outcome.lower():
-                    physical_score -= 1.0
-            else:
-                if "nothing" in outcome.lower():
-                    physical_score += 1.0
+            scores[key] = score
             
-            # LLMによる評価
-            prompt = f"""Scenario: Replace "{original}" with "{replacement}" in the context.
-
-Original properties: rigidity={original_props['rigidity']:.2f}, support={original_props['support']:.2f}, harm={original_props['harm']:.2f}
-Replacement properties: rigidity={replacement_props['rigidity']:.2f}, support={replacement_props['support']:.2f}, harm={replacement_props['harm']:.2f}
-
-Outcome to evaluate: "{outcome}"
-
-Is this outcome logically consistent with the physical properties?
-
-(A) Yes, consistent
-(B) No, inconsistent
-
-Answer: <choice>A</choice> or <choice>B</choice>"""
-            
-            response = self.generate_short(prompt, tokens=50)
-            
-            match = re.search(r"<choice>([AB])</choice>", response)
-            llm_score = 1.0 if (match and match.group(1) == "A") else 0.0
-            
-            # 総合スコア
-            total_score = physical_score + (llm_score * 2.0)
-            scores[key] = total_score
-            
-            print(f"    Physical Score: {physical_score:.2f}, LLM Score: {llm_score:.2f}, Total: {total_score:.2f}")
+            if os.getenv("DEBUG_LLM"):
+                print(f"    Extracted severity: {extracted_severity:.2f}, Expected: {expected_severity:.3f}")
+            print(f"    Severity: {extracted_severity:.2f}, Distance: {distance:.3f}, Score: {score:.2f}/10")
         
         # 最高スコアを選択
         best_option = max(scores, key=scores.get)
