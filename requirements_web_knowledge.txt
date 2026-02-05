@@ -1,0 +1,16 @@
+# CausalOS v4 - Web Knowledge Integration Dependencies
+
+# Core web search (API-free)
+duckduckgo-search>=6.0.0
+
+# HTML parsing (for future enhancements)
+beautifulsoup4>=4.12.0
+
+# HTTP requests (dependency of duckduckgo-search)
+requests>=2.31.0
+
+# Note: These are OPTIONAL dependencies for web knowledge integration
+# CausalOS v4 will work without them, but web search features will be disabled
+
+# Installation command:
+# pip install -r requirements_web_knowledge.txt
