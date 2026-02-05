@@ -110,7 +110,9 @@ class CausalAnalogyMapper:
             return self.embedding_cache[word]
 
         with torch.no_grad():
-            tokens = self.tokenizer(word, return_tensors="pt").to(device)
+            tokens = self.tokenizer(word, return_tensors="pt")
+            model_device = next(self.model.parameters()).device
+            tokens = tokens.to(model_device)
             embeddings = self.model.get_input_embeddings()
             word_embedding = embeddings(tokens.input_ids).mean(dim=1).squeeze(0)
             # Normalize
@@ -160,7 +162,9 @@ Category: {category}
 Goal: Generate a creative "What if" variation or a new concept based on this transformation.
 Invention idea:"""
 
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(device)
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        model_device = next(self.model.parameters()).device
+        inputs = {k: v.to(model_device) for k, v in inputs.items()}
         with torch.no_grad():
             outputs = self.model.generate(**inputs, max_new_tokens=100, do_sample=True, temperature=0.8)
         response = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[-1]:], skip_special_tokens=True)
@@ -190,15 +194,28 @@ class SMatrixEngineV4:
         return logits
 
 class UnifiedCausalOSV4:
-    def __init__(self, n_nodes=50, model_id="Qwen/Qwen2.5-7B-Instruct", search_fn=None, use_premise_aware=True, use_web_knowledge=False):
+    def __init__(self, n_nodes=50, model_id="Qwen/Qwen2.5-7B-Instruct", search_fn=None, 
+                 use_premise_aware=True, use_web_knowledge=False, use_transformation_engine=True):
         print(f"[OS v4] Initializing with {model_id}", flush=True)
         self.n_nodes = n_nodes
         self.search_fn = search_fn
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=dtype, device_map="auto"
-        )
+        
+        # GPU優先でモデルをロード
+        if torch.cuda.is_available():
+            print(f"[OS v4] Loading model on GPU (CUDA)", flush=True)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id, 
+                torch_dtype=torch.float16,
+                device_map="cuda:0"  # 明示的にGPUを指定
+            )
+        else:
+            print(f"[OS v4] Loading model on CPU", flush=True)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id, 
+                torch_dtype=torch.float32,
+                device_map="cpu"
+            )
         self.core = CausalCoreV4(n_nodes=n_nodes)
         self.s_matrix = SMatrixEngineV4()
         self.invention_engine = OsbornInventionEngine(self.model, self.tokenizer)
@@ -240,6 +257,18 @@ class UnifiedCausalOSV4:
                 self.knowledge_augmented = None
         else:
             self.knowledge_augmented = None
+        
+        # Initialize Causal Transformation Engine (Osborn-based creativity)
+        if use_transformation_engine:
+            try:
+                from CausalTransformationEngine import CausalTransformationEngine
+                self.transformation_engine = CausalTransformationEngine(self)
+                print("[OS v4] Causal transformation engine enabled", flush=True)
+            except Exception as e:
+                print(f"[OS v4] Warning: Could not load transformation engine: {e}", flush=True)
+                self.transformation_engine = None
+        else:
+            self.transformation_engine = None
 
     def get_node_idx(self, label):
         label = label.lower().strip()
@@ -284,13 +313,20 @@ Example: [
 Text: "{text}"
 JSON:"""
 
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(device)
+
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        # Move inputs to the device where the model's first layer is located
+        # This handles device_map="auto" cases where model is split across devices
+        model_device = next(self.model.parameters()).device
+        inputs = {k: v.to(model_device) for k, v in inputs.items()}
+        
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs, max_new_tokens=300, do_sample=False,
                 pad_token_id=self.tokenizer.eos_token_id
             )
-        response = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[-1]:], skip_special_tokens=True)
+        response = self.tokenizer.decode(outputs[0][inputs['input_ids'].shape[-1]:], skip_special_tokens=True)
+
         print(f"[OS v4] Model Response: {response}")
 
         try:
@@ -367,7 +403,9 @@ Extract the most definitive factual string or sequence from these results that a
 The output should be just the factual string itself, as short and precise as possible.
 Fact:"""
             
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(device)
+            inputs = self.tokenizer(prompt, return_tensors="pt")
+            model_device = next(self.model.parameters()).device
+            inputs = {k: v.to(model_device) for k, v in inputs.items()}
             with torch.no_grad():
                 outputs = self.model.generate(**inputs, max_new_tokens=50, do_sample=False)
             fact = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[-1]:], skip_special_tokens=True).strip()
@@ -437,10 +475,12 @@ Counterfactual: "{cf}"
 Identify the node being intervened on and the nature of the change.
 JSON: {{"intervened_node": "NAME", "change_type": "replacement|negation|impossible"}}"""
 
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(device)
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        model_device = next(self.model.parameters()).device
+        inputs = {k: v.to(model_device) for k, v in inputs.items()}
         with torch.no_grad():
             outputs = self.model.generate(**inputs, max_new_tokens=100, do_sample=False)
-        response = self.tokenizer.decode(outputs[0][inputs.input_ids.shape[-1]:], skip_special_tokens=True)
+        response = self.tokenizer.decode(outputs[0][inputs['input_ids'].shape[-1]:], skip_special_tokens=True)
 
         node_name = "unknown"
         change_type = "replacement"
@@ -490,10 +530,12 @@ JSON: {{"intervened_node": "NAME", "change_type": "replacement|negation|impossib
         effect = triplet.get("effect")
         prompt = f"Cause: {cause}\nEffect: {effect}\nAbstract this into a general causal principle or physical law.\nGeneral Principle:"
         
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(device)
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        model_device = next(self.model.parameters()).device
+        inputs = {k: v.to(model_device) for k, v in inputs.items()}
         with torch.no_grad():
             outputs = self.model.generate(**inputs, max_new_tokens=100, do_sample=False)
-        return self.tokenizer.decode(outputs[0][inputs.input_ids.shape[-1]:], skip_special_tokens=True).strip()
+        return self.tokenizer.decode(outputs[0][inputs['input_ids'].shape[-1]:], skip_special_tokens=True).strip()
 
     def find_causal_analogy(self, abstracted_principle, domain):
         """
@@ -501,10 +543,12 @@ JSON: {{"intervened_node": "NAME", "change_type": "replacement|negation|impossib
         """
         prompt = f"Principle: {abstracted_principle}\nTarget Domain: {domain}\nFind a similar causal relationship in the target domain.\nAnalogy (Cause -> Effect):"
         
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(device)
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        model_device = next(self.model.parameters()).device
+        inputs = {k: v.to(model_device) for k, v in inputs.items()}
         with torch.no_grad():
             outputs = self.model.generate(**inputs, max_new_tokens=100, do_sample=False)
-        return self.tokenizer.decode(outputs[0][inputs.input_ids.shape[-1]:], skip_special_tokens=True).strip()
+        return self.tokenizer.decode(outputs[0][inputs['input_ids'].shape[-1]:], skip_special_tokens=True).strip()
 
     def generate_inventive_spark(self, context_text, target_domain="any"):
         """
@@ -544,11 +588,13 @@ Inventive Idea: {variation}
         """
         Generation loop with S-matrix intervention.
         """
-        input_ids = self.tokenizer(prompt, return_tensors="pt").to(device).input_ids
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        model_device = next(self.model.parameters()).device
+        input_ids = inputs.input_ids.to(model_device)
         generated_ids = input_ids[0].tolist()
 
         for _ in range(max_new_tokens):
-            input_tensor = torch.tensor([generated_ids]).to(device)
+            input_tensor = torch.tensor([generated_ids]).to(model_device)
             with torch.no_grad():
                 outputs = self.model(input_tensor)
                 logits = outputs.logits[0, -1, :]
