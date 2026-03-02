@@ -1,136 +1,138 @@
-# CausalOS - LLM 因果推論・ハルシネーション防止フレームワーク
+# REMflow + CausalOS 統合フレームワーク（RAG / Web検索 / Fine-tuning / 多バックエンド推論）
 
-CausalOSは、LLM（大規模言語モデル）に因果推論能力を付与し、ハルシネーションの防止、反実推論の精度向上、および動的な計画遂行を実現するための実験的フレームワークです。  
-詳細は↓  
-https://github.com/l-r-w-250111/Causal_Linker.git  
+このリポジトリは、**RAG（短期記憶）**・**Web検索**・**LoRA学習（CPT/SFT）**・**複数推論バックエンド**（Ollama / vLLM / Unsloth / CausalOS-Transformers）を、**Docker Compose + Streamlit UI**で一体運用する実験基盤です。
 
-## 主な機能
+加えて **CausalOS（因果推論・ハルシネーション防止）** を統合し、**Verified/Exact（根拠優先/抽出優先）**、**URL捏造防止（post-check）**、**S行列（因果メモリ）**、**trust_remote_code トグル**等を備えます。
 
-1.  **迷い（Hesitation）の検知**:
-    - LLMの出力ロジットから、エントロピー、Top-1確率、尖度（Kurtosis）、位相（Phi）、慣性（CII）などの指標をリアルタイムで算出します。
-    - これらの指標により、モデルが「統計的な確信度」を失っているタイミング（ハルシネーションが起きやすい瞬間）を特定します。
+---
+## 1. 目的
+- **エンドツーエンド**：データ準備 → CPT/SFT（LoRA） → 変換（GGUF/AWQ） → 推論（チャット）までを1つのUIで扱う。
+- **RAG + Web検索**：社内/個人ドキュメントと外部情報を切り替え、根拠を付けて応答する。
+- **CausalOS統合**：因果メモリ（S行列）とガード（Verified/Exact, post-check）により、固有名詞/URL/論文等の捏造を抑制する。
 
-2.  **S行列（Scattering Matrix）による剛性誘導**:
-    - 事実情報（論文名、固有名詞、定義など）を「剛性の高いトークン列」として登録します。
-    - LLMに「迷い」が生じた際、S行列に基づいてロジット（logits）を調整し、正しい事実（因果のレール）へと出力を誘導します。
+---
+## 2. 主要機能（概要）
+### 2.1 Streamlit UI（統合コンソール）
+- チャットUI：モデルと対話（RAG / Web検索 自動切替・手動切替）
+- 学習ワークフロー：Step1〜4（DL → CPT → SFT → 変換/デプロイ）
+- セッション管理：チャット履歴の保存と再利用（SFTデータ化にも利用）
 
-3.  **動的な因果ノード抽出と介入ポイントの特定**:
-    - `CausalNodeExtractor` モジュールにより、テキストから主要なエンティティ（名詞）やアクション（動詞）を動的に抽出します。
-    - 事実（Factual）と反事実（Counterfactual）の文章を比較し、どの単語が置き換わったか（介入ポイント）を自動的に特定します。
+### 2.2 推論バックエンド
+- **Ollama**：GGUFモデルの推論・Embedding（GPU/CPU）
+- **vLLM**：高スループット推論（AWQ / bitsandbytes 量子化対応）
+- **Unsloth Server**：軽量サーバでの推論・学習系タスク用
+- **CausalOS / Transformers（PyTorch）**：HFモデルを直接ロードし、quant（4bit/8bit/none）と trust_remote_code に対応
 
-4.  **因果プリミティブ・セレクションによる反実推論**:
-    - 介入の種類（置換、否定、強度、時制、不可能）を検知し、物理パラメータ（$S, r, \phi, \omega$, インデックス置換）への原子操作（Atomic Interventions）にマッピングします。
-    - シミュレーション結果と現象分類から「期待される因果プリミティブ・ベクトル」を生成。
-    - 各選択肢をプリミティブ・ベクトルに変換（分解）し、期待されるベクトルとの距離（L2ノルム）が最も近いものを回答として選択します。
-    - 以下の数式に基づいた動的な因果推論を可能にします：
-      $$x_{j}(t+1) = \sigma \left( \sum_{i} S_{ij} \cdot r_{ij} e^{i(\phi_{ij} + \omega t)} x_{i}(t) \right)$$
+### 2.3 学習（CPT / SFT）
+- **CPT**：生テキストで継続事前学習（LoRA）
+- **SFT**：指示追従・対話形式を学習（LoRA）
+- 生成される学習コマンドをターミナルで実行してUIフリーズを回避
 
-| 現象分類 (Phenomenology) | 原子操作 (Atomic) | 物理パラメータ | 物理的帰結 |
-| :--- | :--- | :--- | :--- |
-| 置換 (A → B) | Delete & Insert | $S_{ij} \to 0, S_{ik} \to 1$ | 接続トポロジーの書き換え |
-| 否定 (Not A) | Invert | $\phi \to \phi + \pi$ | 干渉による信号の相殺 |
-| 強度変化 (More/Less) | Scale | $r \to r \times \alpha$ | 伝播振幅の増減 |
-| 時制・順序 (Before/After) | Delay / Shift | $\omega$ または $t$ | 因果連鎖の到達時間変容 |
-| 不可能性 (Logic Error) | Permute | $S$ の非エルミート化 | エネルギー発散・不安定化 |
+### 2.4 変換・デプロイ
+- **GGUF**：Ollama向けに変換（量子化方式指定）
+- **AWQ**：vLLM向けに量子化（保存先指定）
+- GGUFをOllamaへデプロイするUI機能
 
-6.  **数値的安定性の確保**:
-    - `float16` 環境での計算誤差による `nan` 発生を防ぐため、内部的な指標計算（エントロピーや位相）は `float32` で実行されます。
+### 2.5 CausalOS（因果推論/ハルシネーション防止）
+- **迷い（Hesitation）検知**：entropy / top1 / kurtosis / phi / CII 等（設計コンセプト）
+- **S行列（Scattering Matrix）**：剛性の高いトークン列・因果レールにより出力を誘導（設計コンセプト）
+- **Verified/Exact**：根拠優先・抽出優先の応答モード（実装）
+- **post-check**：検索結果集合に存在しないURLの出力を除去（実装）
+- **S行列ストア**：`./storage/s_matrix.json`（nodes/edges/groups/commits、複素重み雛形 {re,im}、maskメタ）
 
-## セットアップ
+---
+## 3. 現在の実装状態（会話で反映済みの内容）
+### 3.1 追加UI/制御
+- **Answer Mode**：Assist / Verified / Exact
+- **Routing Policy**：Auto / WEB / RAG / NONE
+- **Debug表示**：通常は内部を表示せず、debugオンでルーティング/ソースを表示
 
-### 必要条件
+### 3.2 ルーティング改善
+- 強制WEB：論文/著者/DOI/URL/根拠要求などを検知した場合にWeb検索を優先
+- ルータ出力を **JSON固定**に寄せ、壊れた出力でも正規化して解釈
 
-- Python 3.10+
-- PyTorch
-- Transformers
-- Accelerate
-- NumPy
+### 3.3 安全ガード
+- Web検索結果を可能な限り構造化（title/url/snippet）してSOURCESとして扱う
+- **post-check**：回答内URLが検索結果集合に無ければ `[UNVERIFIED_URL_REMOVED]` に置換
+- Verified/Exact で根拠が弱い場合は **「不明（ソースから確定できません）」**へ落とす（ハルシネ抑制）
+- 一部モデルが出す `<think>...</think>` 等をUI表示前に除去する **サニタイズ**（実装方針）
 
-### インストール
+---
+## 4. 現在の実装で使用される主なファイル（ファイル名一覧）
+> 「実行時に参照/実行される」「UIから呼び出される」ものを中心に列挙します。
 
+### 4.1 エントリーポイント / UI
+- `app.py`：Streamlit UI本体（チャット、RAG管理、学習ワークフロー、各バックエンド制御）
+
+### 4.2 RAG / Web検索
+- `rag_handler.py`：RAGの初期化・ドキュメント追加・retriever提供
+- `web_search.py`：DuckDuckGo（ddgs）検索（現状は整形文字列を返す）
+
+### 4.3 CausalOS（Transformers）
+- `CausalOS_v5_3_full.py`：`UnifiedCausalOSV5_3Full`（quant / trust_remote_code を含むロード対象）
+
+### 4.4 学習/データ/変換（UI Step1-4 から呼び出し）
+- `download_model.py`：Hugging FaceからベースモデルをDL
+- `create_dataset.py`：CPT/SFTデータセット生成（chat履歴やファイルを加工）
+- `train_lora.py`：LoRA学習（Unsloth側）
+- `train_trl.py`：LoRA学習（TRL側）
+- `convert_to_gguf.py`：GGUF変換（Ollama向け）
+- `quantize_to_awq.py`：AWQ量子化（vLLM向け）
+- `unsloth_server.py`：Unsloth推論サーバ（uvicorn）
+
+### 4.5 生成物/永続化（実行時に生成・参照される）
+- `chat_history.json`：チャット履歴（セッション保存）
+- `./storage/s_matrix.json`：S行列ストア（nodes/edges/groups/commits）
+- `./data/`：RAG投入ファイル、CPT/SFTデータ、生成データセット
+- `./base_models/`：ベースモデル格納
+- `./lora_models/`：LoRAアダプタ格納
+- `./gguf_models/`：GGUF出力
+- `./awq_models/`：AWQ出力
+- `./datasets/`：生成データセット出力
+
+### 4.6 コンテナ/設定
+- `docker-compose.yml`（または同等のCompose設定）：ui / unsloth / vllm / ollama-gpu 等を起動
+- `.env` / `.env.example`：環境設定（URLやポート等）
+- `ocker-compose.mamba-builder.yml` ui にmamba-ssmを導入するためのwhl生成用  
+---
+## 5. セットアップ（クイック）
+### 5.1 必要要件
+- Docker / Docker Compose
+- NVIDIA GPU + CUDA（推奨）
+
+### 5.2 起動
 ```bash
-pip install torch transformers accelerate numpy
+cp .env.example .env   # 任意
+docker compose up --build -d
 ```
+UI: `http://localhost:8501`
 
-## 使い方
+---
+## 6. 使い方（UIガイド）
+### 6.1 推論（チャット）
+1. サイドバーで Inference Engine を選択（Ollama / Unsloth / vLLM / CausalOS）
+2. 必要に応じてモデル/サーバを起動
+3. チャット入力
+4. Answer Mode と Routing Policy を調整（根拠重視なら Verified/Exact + Auto/WEB 推奨）
 
-### 1. ハルシネーション防止（論文名検索の例）
+### 6.2 学習（Step1-4）
+- Step1: HFからベースモデルDL
+- Step2: CPT（任意）
+- Step3: SFT（任意）
+- Step4: GGUF/AWQ変換・デプロイ
 
-`test_paper_hallucination.py` を実行すると、S行列を用いて特定の論文名を正確に出力させるデモを確認できます。
+---
+## 7. トラブルシュート（要点）
+- **固有名詞/論文/URL**：Verified/Exactにすると“不明”になりやすいが、ハルシネ抑制として正常。ソースが必要。
+- **trust_remote_code**：Qwen3等で必要になる場合あり。信頼できるモデルにのみON。
+- **Web検索結果が一般論に寄る**：クエリ改善、あるいは `web_search.py` を構造化返却へ移行すると改善。
 
-```bash
-python3 test_paper_hallucination.py
-```
+---
+## 8. ロードマップ（次にやること）
+1. 違和感トリガ（立ち上がり）をS行列/ログと連動して実装
+2. FactGuard（抽出器）統合：Exactを「ソース抽出のみ」に強化
+3. `perform_web_search()` を list[dict] 返却に変更し、SOURCESとpost-checkを堅牢化
+4. S行列スキーマ確定（ノード/エッジ/重み/順序拘束）と commit/replay 条件の明文化
+5. 観測性（trace/log）を最小追加（S参照・拒否判断・使用sourcesの追跡）
+6. CausalOS本体へ：S→prior_mask/A_mask生成、LLM attention と因果マスク統合
 
-**仕組み**:
-- 「Attention Is All You Need」というタイトルをS行列に登録。
-- 生成中にモデルの迷い（CIIのスパイク等）を検知すると、S行列が介入し、正しいトークンを選択させます。
-
-### 2. 反実推論ベンチマーク（CRASS）
-
-`test_crass.py` を実行すると、動的なノード抽出と論理チェックを用いた反実推論のテストを行えます。
-
-```bash
-python3 test_crass.py
-```
-
-**新機能：因果プリミティブ・マッチング**
-CRASSのような多肢選択式問題に対し、以下のステップで解答します：
-1. `Factual` と `Counterfactual` からノードを抽出し、介入の種類（現象分類）を特定。
-2. `CausalCore` で原子操作を適用した物理シミュレーションを実行し、その動態（CSI/CII/発散）を評価。
-3. 現象分類と物理動態から「正解が持つべき因果的特徴（ベクトル）」を算出。
-4. 各選択肢のテキストをプリミティブ・ベクトル（Substitution, Negation, Intensity, Tense, Impossibility）に分解し、最も「因果的に近い」ものを選択。
-
-## 主要クラス・メソッドの使い方
-
-### SMatrixEngine (ハルシネーション防止)
-特定の事実をモデルに「記憶」させ、誘導するために使用します。
-
-```python
-# 事実トークン列の登録
-paper_title = "Attention Is All You Need"
-token_ids = osys.observer.tokenizer.encode(paper_title, add_special_tokens=False)
-osys.s_matrix.register_sequence(token_ids, rigidity=100.0)
-
-# 因果チェック付き生成
-# 迷いを検知すると自動的にS行列が適用されます
-output = osys.generate_with_causal_check(prompt, max_new_tokens=20)
-```
-
-### solve_counterfactual (反実推論)
-シナリオと選択肢を渡すと、因果的な妥当性を評価して最適な回答を返します。
-
-```python
-factual = "A girl eats an apple."
-counterfactual = "What would have happened if the girl had eaten a stone?"
-options = {
-    "A": "She would have been happy.",
-    "B": "She would have broken her teeth.",
-    "C": "She would have felt full."
-}
-
-answer = osys.solve_counterfactual(factual, counterfactual, options=options)
-# answer -> "B"
-```
-
-## ファイル構成
-
-- `CausalOS_v0.py`: フレームワークの本体（Observer, Core, SMatrixEngine, UnifiedOS）。
-- `causal_node_extractor.py`: LLMを用いた動的ノード抽出モジュール。
-- `test_crass.py`: CRASSベンチマーク用テストスクリプト。
-- `test_paper_hallucination.py`: S行列によるハルシネーション防止テストスクリプト。
-
-## 詳細設定
-
-`CausalOS_v0.py` 内の `LLMCausalObserver` で使用するモデル ID を変更できます（デフォルトは `Qwen/Qwen2.5-7B`）。ローカル環境のリソースに合わせて調整してください。
-
-```python
-# CausalOS_v0.py
-class LLMCausalObserver:
-    def __init__(self, model_id="Qwen/Qwen2.5-7B"):
-        ...
-```
-
-## ライセンス
-
-研究・実験目的のプロトタイプとして提供されています。
