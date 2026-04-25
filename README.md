@@ -129,10 +129,8 @@ UI: `http://localhost:8501`
 
 ---
 ## 8. ロードマップ（次にやること）
-1. 違和感トリガ（立ち上がり）をS行列/ログと連動して実装
-2. FactGuard（抽出器）統合：Exactを「ソース抽出のみ」に強化
-3. `perform_web_search()` を list[dict] 返却に変更し、SOURCESとpost-checkを堅牢化
-4. S行列スキーマ確定（ノード/エッジ/重み/順序拘束）と commit/replay 条件の明文化
-5. 観測性（trace/log）を最小追加（S参照・拒否判断・使用sourcesの追跡）
-6. CausalOS本体へ：S→prior_mask/A_mask生成、LLM attention と因果マスク統合
+- 発明ができるAIにする
+-- 因果を扱えること
+-- 自律成長できること
+-- 発想の飛躍・視点転換ができること
 
